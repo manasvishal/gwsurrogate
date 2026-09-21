@@ -758,8 +758,6 @@ class AlignedSpinCoOrbitalFrameSurrogate(ManyFunctionSurrogate):
             the waveform has not been modified
         """
 
-        custom_times = timesM is not None
-
         Amp_22 = h_22[0]['amp']
         phi_22 = h_22[0]['phase']
         domain = np.copy(self.domain)
@@ -864,23 +862,17 @@ class AlignedSpinCoOrbitalFrameSurrogate(ManyFunctionSurrogate):
 
 
         # Get reference index where waveform needs to be aligned.
-        if (abs(fM_ref-fM_low) < 1e-13) and (dtM is not None):
-            # This means that the data is already truncated at fM_low,
-            # so we just need the first index for fM_ref=fM_low
-            refIdx = 0
+        omega_ref = 2*np.pi*fM_ref
+        if omega_ref > omega22_peak:
+            raise ValueError('f_ref is higher than the peak frequency')
+        if do_interp:
+            # The reference time is found on the surrogate's own grid in
+            # the alignment step below; finite differences on a
+            # user-supplied (possibly sparse) timesM grid are too coarse
+            # to locate fM_ref.
+            refIdx = None
         else:
-            omega_ref = 2*np.pi*fM_ref
-            if omega_ref > omega22_peak:
-                raise ValueError('f_ref is higher than the peak frequency')
-
-            if custom_times:
-                # omega22 from finite differences on a user-supplied
-                # (possibly sparse) timesM grid is too coarse to locate
-                # fM_ref; the reference time is found on the surrogate's
-                # own grid in the alignment step below.
-                refIdx = None
-            else:
-                refIdx = self._search_omega(omega22, omega_ref)
+            refIdx = self._search_omega(omega22, omega_ref)
 
 
         # do_not_align should be True only when converting from pySurrogate
@@ -897,9 +889,10 @@ class AlignedSpinCoOrbitalFrameSurrogate(ManyFunctionSurrogate):
             # of arxiv:1812.07865, the resolves the pi ambiguity. This means
             # that the after the realignment, the orbital phase at reference
             # frequency is 0.
-            if custom_times:
-                # Find the time at which the (2,2) frequency reaches fM_ref
-                # on the surrogate's own grid, and zero the phase there.
+            if do_interp:
+                # Zero the phase at the native-grid sample nearest the
+                # fM_ref crossing, for both custom times and dt grids, so
+                # the convention does not depend on the request type.
                 idx_ref = self._search_omega(omega22_sparse, omega_ref)
                 t_ref = domain_omega[idx_ref]
                 phi_ref = _splinterp_Cwrapper(np.array([t_ref]), domain,
