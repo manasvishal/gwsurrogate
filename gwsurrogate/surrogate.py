@@ -1523,6 +1523,24 @@ def CompareSingleModeSurrogate(sur1,sur2):
 
 
 
+def _reflect_frequency(values, freqs):
+    """Return values(-f) on a monotonic frequency grid.
+
+    Used for the frequency-domain negative-mode relation
+    h~_{l,-m}(f) = (-1)^l h~_{l,m}*(-f). Bins whose negative frequency is
+    not on the grid (e.g. the Nyquist bin) are set to zero.
+    """
+    freqs = np.asarray(freqs)
+    idx = np.clip(np.searchsorted(freqs, -freqs), 0, len(freqs) - 1)
+    left = np.clip(idx - 1, 0, len(freqs) - 1)
+    idx = np.where(np.abs(freqs[left] + freqs) < np.abs(freqs[idx] + freqs),
+                   left, idx)
+    exact = np.isclose(freqs[idx], -freqs, rtol=0, atol=1e-12)
+    out = np.zeros_like(values)
+    out[exact] = values[idx[exact]]
+    return out
+
+
 class SurrogateEvaluator(object):
     """
     Class to load and evaluate generic surrogate models.
@@ -1717,6 +1735,24 @@ class SurrogateEvaluator(object):
                     # Looks like this m<0 mode exits, we should be using that.
                     raise Exception('Expected only m>0 modes.')
         return h
+
+    def _fill_negative_modes(self, h, domain):
+        """Add the m<0 modes deduced from the m>0 modes.
+
+        Time domain:      h_{l,-m}(t) = (-1)^l h_{l,m}*(t)
+        Frequency domain: h~_{l,-m}(f) = (-1)^l h~_{l,m}*(-f)
+        """
+        for (ell, m) in list(h.keys()):
+            if (m > 0) and ((ell, -m) not in h):
+                if self._domain_type == 'Frequency':
+                    if not np.all(np.diff(domain) > 0):
+                        raise ValueError('frequency-domain negative modes '
+                                         'require a monotonically increasing '
+                                         'frequency grid')
+                    h[(ell, -m)] = (-1)**ell * np.conj(
+                        _reflect_frequency(h[(ell, m)], domain))
+                else:
+                    h[(ell, -m)] = (-1)**ell * h[(ell, m)].conjugate()
 
 
     def __call__(self, q, chiA0, chiB0, M=None, dist_mpc=None, f_low=None,
@@ -2020,6 +2056,8 @@ class SurrogateEvaluator(object):
                 raise ValueError("Cannot specify both df and freqs.")
 
             if (f_low is None):
+                f_low = getattr(self, '_default_f_low', None)
+            if (f_low is None):
                 raise ValueError("f_low must be specified.")
 
             if (f_ref is not None) and (f_ref < f_low):
@@ -2055,9 +2093,17 @@ class SurrogateEvaluator(object):
         else:
             raise Exception('Invalid units')
 
-        # If f_ref is not given, we set it to f_low.
+        # If f_ref is not given, use the model default if it has one,
+        # otherwise set it to f_low. Model defaults are stored in
+        # dimensionless units.
         if f_ref is None:
-            f_ref = f_low
+            default_f_ref = getattr(self, '_default_f_ref', None)
+            if default_f_ref is None:
+                f_ref = f_low
+            elif units == 'mks':
+                f_ref = default_f_ref / t_scale
+            else:
+                f_ref = default_f_ref
 
         # Get dimensionless step size or times/freqs and reference time/freq
         dtM = None if dt is None else dt/t_scale
@@ -2090,22 +2136,16 @@ class SurrogateEvaluator(object):
 
             h = h_tapered
 
+        # For nonprecessing systems, add the m<0 modes deduced from the
+        # m>0 modes (frequency-domain relation when appropriate).
+        if not self.keywords['Precessing']:
+            self._fill_negative_modes(h, domain)
+
         # sum over modes to get complex strain if inclination is given
         if inclination is not None:
-            # For nonprecessing systems get the m<0 modes from the m>0 modes.
-            fake_neg_modes = not self.keywords['Precessing']
-
             # Follows the LAL convention (see help text)
             h = self._mode_sum(h, inclination, np.pi/2 - phi_ref,
-                    fake_neg_modes=fake_neg_modes)
-        else: # if returning modes, check if m<0 modes need to be generated for nonprecessing systems
-            if not self.keywords['Precessing']:
-                modes = list(h.keys())
-                for mode in modes:
-                    ell = mode[0]
-                    m   = mode[1]
-                    if (m > 0) and ( (ell,-m) not in h.keys()):
-                        h[(ell,-m)] = (-1)**ell * h[(ell,m)].conjugate()
+                    fake_neg_modes=False)
 
         # Rescale domain to physical units
         if self._domain_type == 'Time':
@@ -2131,10 +2171,15 @@ class SurrogateEvaluator(object):
 
         # Rescale waveform to physical units
         if amp_scale != 1:
+            scale = amp_scale
+            if self._domain_type == 'Frequency':
+                # The Fourier transform picks up an extra time scale:
+                # h~_phys(f_Hz) = A_M T_M h~_dim(f_Hz T_M)
+                scale *= t_scale
             if type(h) == dict:
-                h.update((x, y*amp_scale) for x, y in h.items())
+                h.update((x, y*scale) for x, y in h.items())
             else:
-                h *= amp_scale
+                h *= scale
 
         return domain, h, dynamics
 
@@ -2207,6 +2252,57 @@ See the __call__ method on how to evaluate waveforms.
         into a single array.
         For example, for NRHybSur3dq8: x = [q, chiAz, chiBz].
         """
+        if par_dict is not None:
+            raise ValueError('Expected par_dict to be None.')
+        x = [q, chiA0[2], chiB0[2]]
+        return x
+
+
+class NRHybSur3dq8_FD(SurrogateEvaluator):
+    r"""
+A class for the frequency-domain linear (EIM) surrogate built from
+NRHybSur3dq8 by the freq-surr project.
+
+The (2,2) mode is evaluated as h(f) = B_fft^T h(T_i): one sparse
+evaluation of the parent time-domain model at the EIM nodes, then a
+matvec with the precomputed basis transforms. There is no FFT at
+evaluation time.
+
+Milestone 1 supports the artifact's native frequency grid and exact-bin
+subsets of `freqs`. `times`/`dt`, `df`, off-grid `freqs`, and modes other
+than (2,2) are rejected. The parent's f_low/f_ref policy is fixed by the
+artifact; f_ref defaults to the artifact value and f_low defaults to 0
+(output cutoff, not yet applied).
+
+Load by passing the artifact path:
+
+    sur = gwsurrogate.LoadSurrogate(
+        '/path/to/NRHybSur3dq8_FD_22_nonspinning.h5')
+    freqs, h, dyn = sur(q, chiA, chiB, mode_list=[(2,2)])
+   """
+
+    def __init__(self, h5filename):
+        self.h5filename = h5filename
+        domain_type = 'Frequency'
+        keywords = {
+            'Precessing': False,
+            'Hybridized': True,
+            }
+        # soft_lims -> raise warning when outside lims
+        # hard_lim -> raise error when outside lims
+        soft_param_lims = [8.01, 0.801]
+        hard_param_lims = [10.01, 1]
+        super(NRHybSur3dq8_FD, self).__init__(self.__class__.__name__, \
+            domain_type, keywords, soft_param_lims, hard_param_lims)
+        self._default_f_low = 0.0
+        self._default_f_ref = self._sur_dimless.parent_f_ref
+
+    def _load_dimless_surrogate(self, basis_tol_opts=None):
+        from gwsurrogate.new.surrogate import FourierEIMSurrogate
+        return FourierEIMSurrogate.load(self.h5filename)
+
+    def _get_intrinsic_parameters(self, q, chiA0, chiB0, precessing_opts,
+            tidal_opts, par_dict):
         if par_dict is not None:
             raise ValueError('Expected par_dict to be None.')
         x = [q, chiA0[2], chiB0[2]]
@@ -2859,6 +2955,7 @@ further discussion on this point.
 ####       the default cases suitable for most people
 SURROGATE_CLASSES = {
     "NRHybSur3dq8": NRHybSur3dq8,
+    "NRHybSur3dq8_FD_22_nonspinning": NRHybSur3dq8_FD,
     "NRHybSur3dq8_CCE": NRHybSur3dq8_CCE,
     "NRHybSur2dq15": NRHybSur2dq15,
     "NRSur7dq4": NRSur7dq4,

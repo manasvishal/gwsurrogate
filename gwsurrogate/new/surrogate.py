@@ -658,17 +658,27 @@ class FourierEIMSurrogate(object):
                                  % (q, bounds['q_min'], bounds['q_max']))
         return x
 
-    def _check_parent_policy(self, fM_low, fM_ref):
-        for value, stored, label in ((fM_low, self.parent_f_low, 'fM_low'),
-                                     (fM_ref, self.parent_f_ref, 'fM_ref')):
-            if value is not None and abs(value - stored) > 1e-12 * max(1.0, abs(stored)):
-                raise ValueError("%s=%r does not match the artifact's fixed "
-                                 'parent policy (%r)' % (label, value, stored))
+    def _check_parent_policy(self, fM_ref):
+        """The artifact fixes the parent's phase-reference frequency.
+
+        `fM_low` is the public output cutoff and is not forwarded to the
+        parent (the stored support policy governs the coefficients).
+        """
+        if (fM_ref is not None
+                and abs(fM_ref - self.parent_f_ref)
+                > 1e-12 * max(1.0, abs(self.parent_f_ref))):
+            raise ValueError("fM_ref=%r does not match the artifact's fixed "
+                             'parent policy (%r)' % (fM_ref, self.parent_f_ref))
 
     def _exact_bins(self, requested):
         requested = np.atleast_1d(np.asarray(requested, dtype=float))
         idx = np.clip(np.searchsorted(self.freqs, requested), 0,
                       len(self.freqs) - 1)
+        # searchsorted can land one bin high when the request is a hair
+        # above a native bin; take the nearer of the two neighbours.
+        left = np.clip(idx - 1, 0, len(self.freqs) - 1)
+        idx = np.where(np.abs(self.freqs[left] - requested)
+                       < np.abs(self.freqs[idx] - requested), left, idx)
         if not np.allclose(self.freqs[idx], requested, rtol=0, atol=1e-12):
             raise ValueError('requested frequencies are not native FFT bins; '
                              'off-grid interpolation is a later milestone')
@@ -698,7 +708,7 @@ class FourierEIMSurrogate(object):
                              % (unsupported, self.mode_list))
 
         self._check_params(x)
-        self._check_parent_policy(fM_low, fM_ref)
+        self._check_parent_policy(fM_ref)
 
         _, h_dict, _ = self.parent(x, fM_low=self.parent_f_low,
                                    fM_ref=self.parent_f_ref,
