@@ -758,6 +758,8 @@ class AlignedSpinCoOrbitalFrameSurrogate(ManyFunctionSurrogate):
             the waveform has not been modified
         """
 
+        custom_times = timesM is not None
+
         Amp_22 = h_22[0]['amp']
         phi_22 = h_22[0]['phase']
         domain = np.copy(self.domain)
@@ -772,6 +774,7 @@ class AlignedSpinCoOrbitalFrameSurrogate(ManyFunctionSurrogate):
         omega22_peak = omega22_sparse[peak22Idx]
         # We ignore the part after the peak.  This way we avoid the noisy part
         # at late times, which can randomly be at frequency = fM_low.
+        domain_omega = domain[domain <= domain[peak22Idx]]
         omega22_sparse = omega22_sparse[domain <= domain[peak22Idx]]
 
         # Get initIdx such that the initial (2, 2) mode frequency ~ fM_low.
@@ -836,6 +839,7 @@ class AlignedSpinCoOrbitalFrameSurrogate(ManyFunctionSurrogate):
                     raise Exception('Trying to evaluate at times outside the'
                         ' domain.')
 
+            phi_22_sparse = phi_22
             Amp_22 = _splinterp_Cwrapper(timesM, domain, Amp_22)
             phi_22 = _splinterp_Cwrapper(timesM, domain, phi_22)
 
@@ -869,15 +873,23 @@ class AlignedSpinCoOrbitalFrameSurrogate(ManyFunctionSurrogate):
             if omega_ref > omega22_peak:
                 raise ValueError('f_ref is higher than the peak frequency')
 
-            refIdx = self._search_omega(omega22, omega_ref)
+            if custom_times:
+                # omega22 from finite differences on a user-supplied
+                # (possibly sparse) timesM grid is too coarse to locate
+                # fM_ref; the reference time is found on the surrogate's
+                # own grid in the alignment step below.
+                refIdx = None
+            else:
+                refIdx = self._search_omega(omega22, omega_ref)
 
 
         # do_not_align should be True only when converting from pySurrogate
         # format to gwsurrogate format as we may want to do some checks that
         # the waveform has not been modified
         if not do_not_align:
-            # Set orbital phase to 0 refIdx. Note that the Coorbital
-            # frame data is not affected by this constant phase shift.
+            # Set orbital phase to 0 at the reference frequency. Note that
+            # the Coorbital frame data is not affected by this constant
+            # phase shift.
 
             # The orbital phase is obtained as phi_22/2, so this leaves a pi
             # ambiguity.  But the surrogate data is already aligned such that
@@ -885,7 +897,16 @@ class AlignedSpinCoOrbitalFrameSurrogate(ManyFunctionSurrogate):
             # of arxiv:1812.07865, the resolves the pi ambiguity. This means
             # that the after the realignment, the orbital phase at reference
             # frequency is 0.
-            phi_22 += -phi_22[refIdx]
+            if custom_times:
+                # Find the time at which the (2,2) frequency reaches fM_ref
+                # on the surrogate's own grid, and zero the phase there.
+                idx_ref = self._search_omega(omega22_sparse, omega_ref)
+                t_ref = domain_omega[idx_ref]
+                phi_ref = _splinterp_Cwrapper(np.array([t_ref]), domain,
+                                              phi_22_sparse)
+                phi_22 += -phi_ref[0]
+            else:
+                phi_22 += -phi_22[refIdx]
 
         if do_interp:
             h_coorb = _splinterp_Cwrapper_many_complex(timesM, domain, h_coorb)
