@@ -553,6 +553,165 @@ class FastTensorSplineSurrogate(SimpleH5Object):
         return h_modes
 
 
+class FourierEIMSurrogate(object):
+    """Frequency-domain linear (EIM) surrogate of a time-domain model.
+
+    Loads a runtime artifact produced offline by the freq-surr project
+    (schema 'freqsurr-fd-v1'): EIM node times, the Fourier transforms of
+    the windowed EIM basis referenced to the parent's peak-at-t=0
+    convention, and the name of the parent time-domain model. The
+    frequency-domain waveform is B_fft^T h(T_i), where h(T_i) comes from
+    one sparse evaluation of the parent at the EIM nodes; there is no FFT
+    and no basis construction at evaluation time.
+
+    Milestone 1 supports the artifact's native frequency grid and
+    exact-bin subsets of `freqs`; `times`/`dt` and off-grid `freqs` are
+    not supported. The parent's f_low/f_ref policy is fixed by the
+    artifact. See the freq-surr SPEC.md for the numerical contract.
+    """
+
+    SCHEMA_VERSION = 'freqsurr-fd-v1'
+
+    def __init__(self, parent, freqs, eim_times, B_fft, mode_list,
+                 parent_model, parent_f_ref, parent_f_low, t0=None,
+                 dt=None, n_fft=None, param_bounds=None, provenance=None,
+                 fork_commit=None):
+        self.parent = parent
+        self.freqs = np.asarray(freqs)
+        self.eim_times = np.asarray(eim_times)
+        self.B_fft = np.asarray(B_fft)
+        self.mode_list = [tuple(m) for m in mode_list]
+        self.parent_model = parent_model
+        self.parent_f_ref = float(parent_f_ref)
+        self.parent_f_low = float(parent_f_low)
+        self.t0 = t0
+        self.dt = dt
+        self.n_fft = n_fft
+        self.param_bounds = param_bounds or {}
+        self.provenance = provenance or {}
+        self.fork_commit = fork_commit
+
+    @classmethod
+    def load(cls, path, parent=None):
+        """Load an artifact, resolving the parent time-domain model.
+
+        `parent` may be a loaded dimensionless time-domain surrogate (an
+        AlignedSpinCoOrbitalFrameSurrogate); if None, the parent model
+        named in the artifact is loaded from the gwsurrogate download
+        directory.
+        """
+        import json
+        import h5py
+
+        with h5py.File(path, 'r') as f:
+            def attr(name):
+                value = f.attrs[name]
+                return value.decode() if isinstance(value, bytes) else value
+
+            version = attr('schema_version')
+            if version != cls.SCHEMA_VERSION:
+                raise ValueError('unsupported artifact schema %r (expected %r)'
+                                 % (version, cls.SCHEMA_VERSION))
+            parent_model = attr('parent_model')
+            kwargs = dict(
+                freqs=f['freqs'][()],
+                eim_times=f['eim_times'][()],
+                B_fft=f['B_fft'][()],
+                mode_list=[tuple(int(v) for v in m)
+                           for m in json.loads(attr('mode_list'))],
+                parent_model=parent_model,
+                parent_f_ref=float(f.attrs['parent_f_ref']),
+                parent_f_low=float(f.attrs['parent_f_low']),
+                t0=float(f.attrs['t0']),
+                dt=float(f.attrs['dt']),
+                n_fft=int(f.attrs['n_fft']),
+                param_bounds=json.loads(attr('param_bounds')),
+                provenance=json.loads(attr('provenance')),
+                fork_commit=attr('fork_commit'),
+            )
+        if parent is None:
+            parent = cls._load_parent(parent_model)
+        return cls(parent=parent, **kwargs)
+
+    @staticmethod
+    def _load_parent(name):
+        import os
+        from gwsurrogate import catalog
+
+        path = os.path.join(catalog.download_path(), name + '.h5')
+        if not os.path.isfile(path):
+            raise IOError("parent model '%s' not found at %s; run "
+                          "gwsurrogate.catalog.pull('%s')" % (name, path, name))
+        parent = AlignedSpinCoOrbitalFrameSurrogate()
+        parent.load(path)
+        return parent
+
+    def _check_params(self, x):
+        x = np.asarray(x, dtype=float)
+        if x.shape != (3,):
+            raise ValueError('expected intrinsic parameters [q, chiAz, chiBz]')
+        bounds = self.param_bounds
+        if 'q_min' in bounds:
+            q = x[0]
+            if not (bounds['q_min'] <= q <= bounds['q_max']):
+                raise ValueError('q=%g outside the artifact bounds [%g, %g]'
+                                 % (q, bounds['q_min'], bounds['q_max']))
+        return x
+
+    def _check_parent_policy(self, fM_low, fM_ref):
+        for value, stored, label in ((fM_low, self.parent_f_low, 'fM_low'),
+                                     (fM_ref, self.parent_f_ref, 'fM_ref')):
+            if value is not None and abs(value - stored) > 1e-12 * max(1.0, abs(stored)):
+                raise ValueError("%s=%r does not match the artifact's fixed "
+                                 'parent policy (%r)' % (label, value, stored))
+
+    def _exact_bins(self, requested):
+        requested = np.atleast_1d(np.asarray(requested, dtype=float))
+        idx = np.clip(np.searchsorted(self.freqs, requested), 0,
+                      len(self.freqs) - 1)
+        if not np.allclose(self.freqs[idx], requested, rtol=0, atol=1e-12):
+            raise ValueError('requested frequencies are not native FFT bins; '
+                             'off-grid interpolation is a later milestone')
+        return idx
+
+    def __call__(self, x, fM_low=None, fM_ref=None, dtM=None, timesM=None,
+                 dfM=None, freqsM=None, mode_list=None, ellMax=None,
+                 precessing_opts=None, tidal_opts=None, par_dict=None):
+        if timesM is not None or dtM is not None:
+            raise ValueError('FourierEIMSurrogate is frequency-domain: '
+                             'times/dt are not supported')
+        if par_dict is not None:
+            raise ValueError('par_dict must be None')
+        if ellMax is not None:
+            raise ValueError('ellMax is not supported; use mode_list')
+        if precessing_opts is not None or tidal_opts is not None:
+            raise ValueError('precessing/tidal options are not supported')
+        if dfM is not None:
+            raise NotImplementedError('df selection is not implemented yet; '
+                                      'use the native grid or exact freqsM bins')
+
+        requested = (list(self.mode_list) if mode_list is None
+                     else [tuple(m) for m in mode_list])
+        unsupported = [m for m in requested if m not in self.mode_list]
+        if unsupported:
+            raise ValueError('unsupported modes %s; artifact has %s'
+                             % (unsupported, self.mode_list))
+
+        self._check_params(x)
+        self._check_parent_policy(fM_low, fM_ref)
+
+        _, h_dict, _ = self.parent(x, fM_low=self.parent_f_low,
+                                   fM_ref=self.parent_f_ref,
+                                   timesM=self.eim_times,
+                                   mode_list=list(self.mode_list))
+        h_fd = self.B_fft[0].T @ h_dict[(2, 2)]
+
+        if freqsM is not None:
+            idx = self._exact_bins(freqsM)
+            return (np.asarray(freqsM, dtype=float), {(2, 2): h_fd[idx]}, None)
+        return self.freqs, {(2, 2): h_fd}, None
+
+
 class MultiModalSurrogate(ManyFunctionSurrogate):
     """
     A surrogate for multimodal waveforms, where each waveform mode has
