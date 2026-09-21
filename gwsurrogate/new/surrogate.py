@@ -899,7 +899,10 @@ class AlignedSpinCoOrbitalFrameSurrogate(ManyFunctionSurrogate):
         # Return as a dict, for some reason
         h_dict = { mode: h_coorb[idx] for idx, mode in enumerate(mode_list) }
 
-        return timesM, h_dict, None     # None is for dynamics
+
+        dict_manas={"amp22":Amp_22, "phi22":phi_22}
+        return timesM, h_dict, dict_manas
+        # return timesM, h_dict, None     # None is for dynamics
 
     def _set_TaylorT3_factor(self):
         """ Sets a term used in the 0 PN TaylorT3 phase. See Eq.43 of
