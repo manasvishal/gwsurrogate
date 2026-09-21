@@ -1523,24 +1523,6 @@ def CompareSingleModeSurrogate(sur1,sur2):
 
 
 
-def _reflect_frequency(values, freqs):
-    """Return values(-f) on a monotonic frequency grid.
-
-    Used for the frequency-domain negative-mode relation
-    h~_{l,-m}(f) = (-1)^l h~_{l,m}*(-f). Bins whose negative frequency is
-    not on the grid (e.g. the Nyquist bin) are set to zero.
-    """
-    freqs = np.asarray(freqs)
-    idx = np.clip(np.searchsorted(freqs, -freqs), 0, len(freqs) - 1)
-    left = np.clip(idx - 1, 0, len(freqs) - 1)
-    idx = np.where(np.abs(freqs[left] + freqs) < np.abs(freqs[idx] + freqs),
-                   left, idx)
-    exact = np.isclose(freqs[idx], -freqs, rtol=0, atol=1e-12)
-    out = np.zeros_like(values)
-    out[exact] = values[idx[exact]]
-    return out
-
-
 class SurrogateEvaluator(object):
     """
     Class to load and evaluate generic surrogate models.
@@ -1750,7 +1732,7 @@ class SurrogateEvaluator(object):
                                          'require a monotonically increasing '
                                          'frequency grid')
                     h[(ell, -m)] = (-1)**ell * np.conj(
-                        _reflect_frequency(h[(ell, m)], domain))
+                        new_surrogate._reflect_frequency(h[(ell, m)], domain))
                 else:
                     h[(ell, -m)] = (-1)**ell * h[(ell, m)].conjugate()
 

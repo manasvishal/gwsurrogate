@@ -53,6 +53,24 @@ from .tidal_functions import UniversalRelationLambda2ToI, \
 PARAM_NUDGE_TOL = 1.e-12 # Default relative tolerance for nudging edge cases
 
 
+def _reflect_frequency(values, freqs):
+    """Return values(-f) on a monotonic frequency grid.
+
+    Used for the frequency-domain negative-mode relation
+    h~_{l,-m}(f) = (-1)^l h~_{l,m}*(-f). Bins whose negative frequency is
+    not on the grid (e.g. the Nyquist bin) are set to zero.
+    """
+    freqs = np.asarray(freqs)
+    idx = np.clip(np.searchsorted(freqs, -freqs), 0, len(freqs) - 1)
+    left = np.clip(idx - 1, 0, len(freqs) - 1)
+    idx = np.where(np.abs(freqs[left] + freqs) < np.abs(freqs[idx] + freqs),
+                   left, idx)
+    exact = np.isclose(freqs[idx], -freqs, rtol=0, atol=1e-12)
+    out = np.zeros_like(values)
+    out[exact] = values[idx[exact]]
+    return out
+
+
 def _identity(r1, r2):
     return r1, r2
 def _amp_phase(r1, r2):
@@ -575,7 +593,7 @@ class FourierEIMSurrogate(object):
     def __init__(self, parent, freqs, eim_times, B_fft, mode_list,
                  parent_model, parent_f_ref, parent_f_low, t0=None,
                  dt=None, n_fft=None, param_bounds=None, provenance=None,
-                 fork_commit=None):
+                 fork_commit=None, freq_band=(-0.5, 0.5)):
         self.parent = parent
         self.freqs = np.asarray(freqs)
         self.eim_times = np.asarray(eim_times)
@@ -590,6 +608,7 @@ class FourierEIMSurrogate(object):
         self.param_bounds = param_bounds or {}
         self.provenance = provenance or {}
         self.fork_commit = fork_commit
+        self.freq_band = tuple(float(f) for f in freq_band)
 
     @classmethod
     def load(cls, path, parent=None):
@@ -628,6 +647,8 @@ class FourierEIMSurrogate(object):
                 param_bounds=json.loads(attr('param_bounds')),
                 provenance=json.loads(attr('provenance')),
                 fork_commit=attr('fork_commit'),
+                freq_band=(tuple(json.loads(attr('freq_band')))
+                           if 'freq_band' in f.attrs else (-0.5, 0.5)),
             )
         if parent is None:
             parent = cls._load_parent(parent_model)
@@ -684,6 +705,44 @@ class FourierEIMSurrogate(object):
                              'off-grid interpolation is a later milestone')
         return idx
 
+    def _check_band(self, freqs):
+        f_min, f_max = self.freq_band
+        freqs = np.asarray(freqs, dtype=float)
+        if np.any(freqs < f_min) or np.any(freqs > f_max):
+            raise ValueError('requested frequencies outside the validated '
+                             'band [%g, %g]' % (f_min, f_max))
+
+    def _df_grid(self, dfM):
+        f_min, f_max = self.freq_band
+        if dfM <= 0:
+            raise ValueError('df must be positive')
+        n_high = int(np.floor(f_max / dfM + 1e-12))
+        if n_high < 1:
+            raise ValueError('df=%g is larger than the validated band' % dfM)
+        if 2 * n_high + 1 > 1000000:
+            raise ValueError('df=%g would produce more than 1e6 frequency '
+                             'bins' % dfM)
+        return np.arange(-n_high, n_high + 1) * dfM
+
+    def _interpolate_native(self, h_fd_native, freqs_out):
+        """Interpolate the native FD waveform onto ``freqs_out``.
+
+        Real and imaginary parts are interpolated separately (scipy's
+        complex splines are unreliable). The interpolation is restricted
+        to the validated band plus a small margin.
+        """
+        from scipy.interpolate import CubicSpline as _CubicSpline
+
+        f_min, f_max = self.freq_band
+        margin = 0.05 * (f_max - f_min)
+        mask = ((self.freqs >= f_min - margin)
+                & (self.freqs <= f_max + margin))
+        f = self.freqs[mask]
+        h = h_fd_native[mask]
+        re = _CubicSpline(f, h.real)
+        im = _CubicSpline(f, h.imag)
+        return re(freqs_out) + 1j * im(freqs_out)
+
     def __call__(self, x, fM_low=None, fM_ref=None, dtM=None, timesM=None,
                  dfM=None, freqsM=None, mode_list=None, ellMax=None,
                  precessing_opts=None, tidal_opts=None, par_dict=None):
@@ -696,9 +755,6 @@ class FourierEIMSurrogate(object):
             raise ValueError('ellMax is not supported; use mode_list')
         if precessing_opts is not None or tidal_opts is not None:
             raise ValueError('precessing/tidal options are not supported')
-        if dfM is not None:
-            raise NotImplementedError('df selection is not implemented yet; '
-                                      'use the native grid or exact freqsM bins')
 
         requested = (list(self.mode_list) if mode_list is None
                      else [tuple(m) for m in mode_list])
@@ -714,12 +770,33 @@ class FourierEIMSurrogate(object):
                                    fM_ref=self.parent_f_ref,
                                    timesM=self.eim_times,
                                    mode_list=list(self.mode_list))
-        h_fd = self.B_fft[0].T @ h_dict[(2, 2)]
+        h_native = self.B_fft[0].T @ h_dict[(2, 2)]
 
         if freqsM is not None:
-            idx = self._exact_bins(freqsM)
-            return (np.asarray(freqsM, dtype=float), {(2, 2): h_fd[idx]}, None)
-        return self.freqs, {(2, 2): h_fd}, None
+            freqs_out = np.atleast_1d(np.asarray(freqsM, dtype=float))
+            self._check_band(freqs_out)
+            try:
+                idx = self._exact_bins(freqs_out)
+            except ValueError:
+                h_pos = self._interpolate_native(h_native, freqs_out)
+                if np.allclose(freqs_out, -freqs_out[::-1], rtol=0, atol=1e-12):
+                    h_neg = np.conj(h_pos[::-1])
+                else:
+                    h_neg = np.conj(
+                        self._interpolate_native(h_native, -freqs_out))
+            else:
+                h_pos = h_native[idx]
+                h_neg = np.conj(_reflect_frequency(h_native, self.freqs))[idx]
+        elif dfM is not None:
+            freqs_out = self._df_grid(dfM)
+            h_pos = self._interpolate_native(h_native, freqs_out)
+            h_neg = np.conj(h_pos[::-1])
+        else:
+            freqs_out = self.freqs
+            h_pos = h_native
+            h_neg = np.conj(_reflect_frequency(h_native, self.freqs))
+
+        return freqs_out, {(2, 2): h_pos, (2, -2): h_neg}, None
 
 
 class MultiModalSurrogate(ManyFunctionSurrogate):
